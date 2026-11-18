@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/btc-race-24h-20261118-1444/hajeesam/btc-race-bot-20261118/rank.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
 [![reward](https://make.fun/badge/btc-race-24h-20261118-1444/hajeesam/btc-race-bot-20261118/reward.svg)](https://make.fun/bounty/btc-race-24h-20261118-1444?utm_source=github&utm_medium=readme&utm_campaign=btc-race-24h-20261118-1444)
 
-Dip-Recovery Hold — a long-only cbBTC trading bot for make.fun's 24-hour BTC race. It makes at most one trade: it buys the full $1,000 paper cash the first time the 1-minute close recovers above the close 12 bars earlier (a dip turning back up), or halfway through the window if that recovery never comes, then holds to the end. No exits, no stop-loss, no re-entry — a full round trip costs about 26 bps in fees, slippage and impact, so churning on one-minute noise does not pay.
+Dip-Buy — a long-only cbBTC trading bot for make.fun's 24-hour BTC race. It makes at most one round trip: it buys the full $1,000 paper cash when the 1-minute close falls at least 2% below the highest close of the previous 48 bars (a genuine dip, not one-minute noise), and sells when the close recovers at least 2% above the buy's fill price. If no 2% dip ever appears, it buys halfway through the window instead, so it always takes at least one trade. After the sell it never trades again — a full round trip costs about 26 bps in fees, slippage and impact, so churning on one-minute noise does not pay.
 
 ## Run it
 

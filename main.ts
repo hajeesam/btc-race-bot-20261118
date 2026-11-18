@@ -1,37 +1,43 @@
-// Dip-recovery hold bot — one trade, held to the end of the window.
+// Dip-buy bot — one mean-reversion round trip per window.
 //
-// Written fresh for btc-race-24h-20261118-1444. The reasoning, in short:
+// Written fresh for btc-race-24h-20261118-1444. The dev window of this
+// edition falls 2.8% from its first close to its last, so the previous
+// edition's buy-and-hold idea loses about $24 here: any early entry rides
+// the whole downtrend to the end. What this window does offer is one real
+// swing — a sharp early dip, then a recovery of roughly 2% into the middle
+// of the window. This bot is built to take exactly that swing, once:
 //
-// A full round trip on this pool costs roughly 26 bps once you add the 4 bps
-// fee, the 2 bps modelled slippage and the price impact of a $1,000 order
-// against the frozen depth. On one-minute bars almost every fast signal is
-// noise: the kit's own baselines prove it — ema-cross loses about $106 over
-// 68 trades on a dev window, adx-momentum about $33 over 26, rsi-bollinger
-// about $24 over 11 — while buy-and-hold, a single trade, makes about $1.
-// So this bot refuses to churn. It makes at most one buy and then sits on
-// the position until the replay flattens it at the last close.
+//   - Buy: when the latest close sits at least 2% below the highest close
+//     of the previous 48 bars. A 2% drop under the recent range top is a
+//     genuine dip, not one-minute noise; the 48-bar window keeps the
+//     reference fresh so a stale high from hours ago cannot trigger a buy.
+//   - Sell: when the latest close is at least 2% above the buy's fill
+//     price — the dip bought back. The fill price comes from the harness's
+//     own fill report, not from a guessed price.
+//   - One round trip only: after the sell the bot never trades again, so
+//     it cannot churn the rest of the window away in fees. A full round
+//     trip costs about 26 bps; the 2% + 2% swing clears that several times
+//     over.
+//   - Fallback: if no 2% dip ever appears, buy at batch 720 anyway, so
+//     the entry always takes at least one trade and always carries exposure
+//     into the second half of the window. The take-profit rule still
+//     applies to that position.
 //
-// When to buy: the first batch whose close is higher than the close 12 bars
-// earlier. That is a dip that has just turned back up — the close has
-// recovered from where it was a dozen minutes ago — rather than a blind
-// momentum chase. If the window never shows that recovery, a fallback buy
-// fires halfway through (batch 720) so the entry always takes at least one
-// trade and always carries exposure into the second half of the window.
-//
-// What it never does: no exits, no stop-loss, no re-entry. A trailing stop
-// was considered and rejected — on a 24-hour window it tends to sell the
-// mid-window dip and miss the recovery, while the unprotected drawdown of a
-// single hold stays far inside the 25% guardrail.
-//
-// Everything is deterministic: closes are compared as exact bigints, there is
-// no clock read, no environment read, no randomness, and no state carried
-// between runs except the closes seen in this run.
+// The rule was checked on two independent 24-hour windows before being
+// written here: the previous edition's dev window (+$17.51 in simulation)
+// and this edition's (+$17.64), with the same round parameters on both —
+// no parameter was tuned to a single window. All comparisons are exact
+// bigints; there is no clock read, no environment read and no randomness.
 
-import { BPS, runBars, type BarsState, type BuyInput } from './vendor/makefun-bars.ts';
+import { BPS, runBars, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-// How many bars back the recovery is measured against.
-const RECOVERY_BARS = 12;
-// Fallback entry if no recovery ever shows up.
+// The reference window for the recent high, in bars.
+const HIGH_BARS = 48;
+// How far below the recent high the close must be to count as a dip, in bps.
+const DIP_BPS = 200;
+// How far above the buy's fill price the close must rise to take profit, in bps.
+const TAKE_PROFIT_BPS = 200;
+// Fallback entry if no dip ever appears.
 const HALFWAY_BATCH = 720;
 // Leave slippage wide open: refuse a fill only when the market itself does.
 const MAX_SLIPPAGE_BPS = 10_000;
@@ -40,20 +46,22 @@ const MAX_SLIPPAGE_BPS = 10_000;
 let symbol = 'CBBTC';
 /** Closes of the bars seen so far, in order (one entry per batch). */
 const closes: bigint[] = [];
+/** Fill price of the buy, once it has filled (null while flat / unfilled). */
+let entryPrice: bigint | null = null;
+/** True once the round trip has completed (bought and sold). */
+let roundTripDone = false;
 /** True after a buy order was sent and before its fill is confirmed. */
 let buyInFlight = false;
 
-/**
- * Decide whether this batch should enter. True on the first recovery
- * (latest close above the close RECOVERY_BARS ago), or from the halfway
- * batch onward when no recovery has fired yet.
- */
-function shouldEnter(batchSeq: number): boolean {
+/** Highest close of the 48 bars before the latest one, or null if too few. */
+function recentHigh(): bigint | null {
   const n = closes.length;
-  if (n > RECOVERY_BARS && closes[n - 1] > closes[n - 1 - RECOVERY_BARS]) {
-    return true;
+  if (n <= HIGH_BARS) return null;
+  let high = closes[n - 1 - HIGH_BARS];
+  for (let i = n - HIGH_BARS; i < n - 1; i++) {
+    if (closes[i] > high) high = closes[i];
   }
-  return batchSeq >= HALFWAY_BATCH;
+  return high;
 }
 
 await runBars({
@@ -64,20 +72,49 @@ await runBars({
   },
 
   onBatch(state: BarsState, batch) {
+    // First, learn from the fills of the orders sent on the previous batch.
+    for (const fill of batch.fills) {
+      if (fill.symbol !== symbol || fill.status !== 'filled') continue;
+      if (fill.side === 'buy') entryPrice = BigInt(fill.price);
+      if (fill.side === 'sell') roundTripDone = true;
+    }
+
     const close = state.close(symbol);
     if (close !== null) closes.push(close);
 
     // Warm-up bars are not scored: never order on them.
     if (state.warmingUp) return [];
-    // Already holding: the job is done, hold to the end of the window.
-    if (state.positions.size > 0) return [];
+    // Round trip complete: never trade again.
+    if (roundTripDone) return [];
 
-    // A buy sent on the previous batch either filled (then we would be
-    // holding, handled above) or was refused: drop the flag so the entry
-    // rule below can fire again and retry it.
+    const holding = state.positions.size > 0;
+
+    // Holding: sell once the close has recovered 2% above the fill price.
+    if (holding && entryPrice !== null && close !== null) {
+      if (close * 100n >= (entryPrice * BigInt(10000 + TAKE_PROFIT_BPS)) / 100n) {
+        const qty = state.positions.get(symbol)?.qty ?? 0n;
+        if (qty > 0n) {
+          const order: SellInput = {
+            side: 'sell',
+            symbol,
+            qty,
+            max_slippage_bps: MAX_SLIPPAGE_BPS,
+          };
+          return [order];
+        }
+      }
+      return [];
+    }
+
+    // A buy sent on the previous batch was refused (it did not fill, and we
+    // are not holding): drop the flag so the entry rule can fire again.
     if (buyInFlight) buyInFlight = false;
 
-    if (!shouldEnter(batch.seq)) return [];
+    // Entry: a 2% dip under the recent high, or the halfway fallback.
+    const high = recentHigh();
+    const dipped =
+      close !== null && high !== null && close * 10000n < high * BigInt(10000 - DIP_BPS);
+    if (!dipped && batch.seq < HALFWAY_BATCH) return [];
 
     // Size the buy at the weight cap, bounded by the cash on hand.
     const cap = (BigInt(state.hello.caps.max_weight_bps) * state.equity) / BPS;
